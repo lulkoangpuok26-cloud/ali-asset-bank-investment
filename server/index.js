@@ -2,12 +2,12 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
-import jwt from "jsonwebtoken";
 import { PrismaClient } from "@prisma/client";
 import { requireAuth, prisma, hashPassword, comparePassword, hashPin, comparePin, createToken } from "./lib/auth.js";
 
 const app = express();
 const PORT = process.env.PORT || 4000;
+const REFERRAL_PERCENTAGE = 8;
 
 app.use(cors({
   origin: process.env.CLIENT_URL || "http://localhost:5173",
@@ -18,6 +18,13 @@ app.use(morgan("dev"));
 
 function generateReferralCode() {
   return `ALI-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+}
+
+function normalizeInviteCode(value) {
+  if (!value) return null;
+  const stringValue = String(value).trim();
+  const match = stringValue.match(/(?:invite=|code=)?([A-Z0-9-]{6,})/i);
+  return (match ? match[1] : stringValue).toUpperCase();
 }
 
 function getUserPortfolioData(userId) {
@@ -45,6 +52,27 @@ app.get("/api/health", (_, res) => {
   res.json({ ok: true, service: "Ali Asset Bank Investment API" });
 });
 
+app.get("/api/markets", (_, res) => {
+  res.json({
+    base: "USD",
+    rates: {
+      USD: 1,
+      EUR: 0.92,
+      GBP: 0.79,
+      SDG: 600,
+      KES: 129,
+      NGN: 1560,
+      SAR: 3.75,
+      AED: 3.67,
+      JPY: 157.5,
+      CNY: 7.26,
+      CAD: 1.36,
+      AUD: 1.51
+    },
+    updatedAt: new Date().toISOString()
+  });
+});
+
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { name, email, password, phone, pin, inviteCode } = req.body;
@@ -53,12 +81,13 @@ app.post("/api/auth/register", async (req, res) => {
       return res.status(400).json({ message: "All fields are required." });
     }
 
-    if (!inviteCode) {
+    const normalizedInviteCode = normalizeInviteCode(inviteCode || req.query.inviteCode);
+    if (!normalizedInviteCode) {
       return res.status(403).json({ message: "Registration requires a valid invitation link." });
     }
 
     const referralUser = await prisma.user.findUnique({
-      where: { referralCode: inviteCode.toUpperCase() }
+      where: { referralCode: normalizedInviteCode }
     });
 
     if (!referralUser) {
@@ -84,8 +113,8 @@ app.post("/api/auth/register", async (req, res) => {
         invitedByUserId: referralUser.id,
         accounts: {
           create: [
-            { accountNumber: `AA${Math.floor(100000 + Math.random() * 900000)}`, currency: "USD", balance: 0 },
-            { accountNumber: `AA${Math.floor(100000 + Math.random() * 900000)}`, currency: "EUR", balance: 0 }
+            { accountNumber: `AA${Math.floor(100000 + Math.random() * 900000)}`, currency: "USD", balance: 2500 },
+            { accountNumber: `AA${Math.floor(100000 + Math.random() * 900000)}`, currency: "EUR", balance: 1200 }
           ]
         }
       }
@@ -192,6 +221,16 @@ app.get("/api/dashboard", requireAuth, async (req, res) => {
   const totalDividends = user.dividends.reduce((sum, dividend) => sum + dividend.amount, 0);
   const totalRewards = user.rewards.reduce((sum, reward) => sum + reward.amount, 0);
 
+  const allTransactions = user.accounts.flatMap((account) =>
+    account.transactions ? account.transactions : []
+  );
+
+  const transactionRows = await prisma.transaction.findMany({
+    where: { userId: req.user.id },
+    orderBy: { createdAt: "desc" },
+    take: 20
+  });
+
   res.json({
     user: {
       id: user.id,
@@ -230,11 +269,13 @@ app.get("/api/dashboard", requireAuth, async (req, res) => {
       createdAt: reward.createdAt
     })),
     invitedUsers: user.invitedUsers,
+    transactions: transactionRows,
     totals: {
       investments: totalInvestments,
       dividends: totalDividends,
       rewards: totalRewards
-    }
+    },
+    allTransactions
   });
 });
 
@@ -307,7 +348,7 @@ app.post("/api/invest", requireAuth, async (req, res) => {
     });
 
     if (inviter) {
-      const referralCommission = Number(amount) * 0.08;
+      const referralCommission = Number(amount) * (REFERRAL_PERCENTAGE / 100);
 
       await prisma.reward.create({
         data: {
@@ -315,7 +356,7 @@ app.post("/api/invest", requireAuth, async (req, res) => {
           sourceUserId: req.user.id,
           type: "REFERRAL_PROMOTION",
           amount: referralCommission,
-          percentage: 8
+          percentage: REFERRAL_PERCENTAGE
         }
       });
 
@@ -355,27 +396,114 @@ app.post("/api/invest", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/api/transactions", requireAuth, async (req, res) => {
-  const user = await prisma.user.findUnique({
-    where: { id: req.user.id },
-    include: {
-      accounts: {
-        include: {
-          transactions: {
-            orderBy: { createdAt: "desc" }
-          }
-        }
-      }
+app.post("/api/dividends/claim", requireAuth, async (req, res) => {
+  try {
+    const pending = await prisma.dividend.findMany({
+      where: { userId: req.user.id, status: "PENDING" }
+    });
+
+    if (!pending.length) {
+      return res.status(400).json({ message: "No pending dividend to claim." });
     }
+
+    const total = pending.reduce((sum, item) => sum + item.amount, 0);
+    const account = await prisma.account.findFirst({
+      where: { userId: req.user.id, currency: "USD" }
+    });
+
+    if (!account) {
+      return res.status(404).json({ message: "USD account not found." });
+    }
+
+    await prisma.dividend.updateMany({
+      where: { userId: req.user.id, status: "PENDING" },
+      data: { status: "PAID", payoutDate: new Date() }
+    });
+
+    await prisma.account.update({
+      where: { id: account.id },
+      data: { balance: Number(account.balance) + total }
+    });
+
+    await prisma.transaction.create({
+      data: {
+        userId: req.user.id,
+        accountId: account.id,
+        type: "CREDIT",
+        amount: total,
+        currency: "USD",
+        description: "Dividend payout",
+        reference: `DIV-${Date.now()}`,
+        status: "COMPLETED"
+      }
+    });
+
+    res.json({
+      message: "Dividend payout claimed successfully.",
+      amount: total
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Dividend claim failed." });
+  }
+});
+
+app.post("/api/withdraw", requireAuth, async (req, res) => {
+  try {
+    const { amount, currency } = req.body;
+    const account = await prisma.account.findFirst({
+      where: { userId: req.user.id, currency: currency || "USD" }
+    });
+
+    if (!account) {
+      return res.status(404).json({ message: "Account not found." });
+    }
+
+    if (Number(amount) > Number(account.balance)) {
+      return res.status(400).json({ message: "Insufficient account balance." });
+    }
+
+    await prisma.account.update({
+      where: { id: account.id },
+      data: { balance: Number(account.balance) - Number(amount) }
+    });
+
+    await prisma.transaction.create({
+      data: {
+        userId: req.user.id,
+        accountId: account.id,
+        type: "DEBIT",
+        amount: Number(amount),
+        currency: currency || "USD",
+        description: "Withdrawal",
+        reference: `WTH-${Date.now()}`,
+        status: "COMPLETED"
+      }
+    });
+
+    res.json({
+      message: "Withdrawal processed successfully.",
+      amount: Number(amount),
+      currency: currency || "USD"
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Withdrawal failed." });
+  }
+});
+
+app.get("/api/transactions", requireAuth, async (req, res) => {
+  const rows = await prisma.transaction.findMany({
+    where: { userId: req.user.id },
+    orderBy: { createdAt: "desc" }
   });
 
-  const transactions = user.accounts.flatMap((account) => account.transactions);
-  res.json({ transactions: transactions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)) });
+  res.json({ transactions: rows });
 });
 
 app.get("/api/invite/:code", async (req, res) => {
   const user = await prisma.user.findUnique({
-    where: { referralCode: req.params.code.toUpperCase() }
+    where: { referralCode: normalizeInviteCode(req.params.code) }
   });
 
   if (!user) {
