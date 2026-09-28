@@ -1,0 +1,105 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model User {
+  id                 String          @id @default(cuid())
+  name               String
+  email              String          @unique
+  phone              String
+  passwordHash       String
+  pinHash            String
+  failedPinAttempts  Int             @default(0)
+  isLocked           Boolean         @default(false)
+  lockedUntil        DateTime?
+  isBiometricEnabled Boolean         @default(false)
+  referralCode      String          @unique
+  invitedByUserId    String?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  invitedBy          User?           @relation("InviteRelation", fields: [invitedByUserId], references: [id])
+  invitedUsers       User[]          @relation("InviteRelation")
+
+  accounts           Account[]
+  investments        Investment[]
+  dividends          Dividend[]
+  rewards            Reward[]
+  transactions       Transaction[]
+}
+
+model Account {
+  id            String       @id @default(cuid())
+  userId        String
+  accountNumber String       @unique
+  currency      String       @default("USD")
+  balance       Float        @default(0)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  user          User         @relation(fields: [userId], references: [id])
+  transactions  Transaction[]
+}
+
+model Investment {
+  id              String    @id @default(cuid())
+  userId          String
+  amount          Float
+  planType        String
+  yieldRate       Float
+  monthlyYield    Float
+  expectedReturn  Float
+  status          String    @default("ACTIVE")
+  createdAt       DateTime  @default(now())
+  nextPayoutDate  DateTime
+
+  user            User      @relation(fields: [userId], references: [id])
+  dividends       Dividend[]
+}
+
+model Dividend {
+  id               String    @id @default(cuid())
+  userId           String
+  investmentId     String
+  amount           Float
+  period           String
+  payoutDate       DateTime
+  status           String    @default("PAID")
+  createdAt        DateTime  @default(now())
+
+  user             User      @relation(fields: [userId], references: [id])
+  investment       Investment @relation(fields: [investmentId], references: [id])
+}
+
+model Reward {
+  id          String    @id @default(cuid())
+  userId      String
+  sourceUserId String?
+  type        String
+  amount      Float
+  percentage  Float
+  createdAt   DateTime  @default(now())
+
+  user        User      @relation(fields: [userId], references: [id])
+}
+
+model Transaction {
+  id               String      @id @default(cuid())
+  accountId        String
+  userId           String
+  type             String
+  amount           Float
+  currency         String
+  description      String
+  reference        String      @unique
+  status           String      @default("COMPLETED")
+  createdAt        DateTime    @default(now())
+
+  account          Account     @relation(fields: [accountId], references: [id])
+  user             User        @relation(fields: [userId], references: [id])
+}
